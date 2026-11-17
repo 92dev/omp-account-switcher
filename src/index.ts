@@ -14,18 +14,28 @@
  * session-active accounts marked and recorded quota usage alongside each row.
  * The view is read-only and remains available while streaming.
  *
- * The pin is session-scoped, exactly like `/session pin`: it sets the sticky
- * credential for `(provider, sessionId)`. Usage-limit handling and auth retry
- * may still route around a pinned account that is blocked or broken, and core
- * persists whichever account actually served a turn into the session file, so
- * a resume re-pins it on its own.
+ * The pin holds until the pinned account really fails. `sessions.pin` alone is
+ * only a preference: core skips a pinned account that carries a usage block
+ * (set by a 429, or by a usage report that reads a window as spent — including
+ * a stale block after the quota was reset early), serves from a sibling, and
+ * records that sibling as the session's account, dropping the pin for good.
+ * So pinning clears the account's blocks and pairs the pin with
+ * `sessions.restrict`, which removes every other account from selection,
+ * rotation, and fallback. Two rules then run on provider errors
+ * ({@link handleProviderError}): an error that leaves a new block on the
+ * pinned account lifts the lock so core can rotate through the other
+ * accounts, and once every other account is blocked too the session goes back
+ * to the pinned account.
+ * The pin is recorded in the session file and re-applied on resume;
+ * `/accounts unpin` drops it.
  */
 
-import type { UsageHistoryEntry } from "@oh-my-pi/pi-ai";
+import type { SessionRestrictionLease, UsageHistoryEntry } from "@oh-my-pi/pi-ai";
 import type {
 	AuthStorage,
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionContext,
 	OAuthAccountSummary,
 } from "@oh-my-pi/pi-coding-agent";
 
@@ -61,6 +71,8 @@ interface AccountUsage {
 interface Account extends OAuthAccountSummary {
 	label: string;
 	usage?: AccountUsage;
+	/** This session's pin: `locked` while no other account may serve, `lifted` after the account failed. */
+	pin?: "locked" | "lifted";
 }
 
 interface ProviderAccounts {
@@ -202,16 +214,173 @@ function describeUsage(usage: AccountUsage | undefined, now: number): string {
 	return parts.join(" · ");
 }
 
+/** `active` is the account serving now; the pin is the account the user chose. */
 function describeAccount(account: Account, now: number): string {
-	const usage = describeUsage(account.usage, now);
-	return account.active ? `active · ${usage}` : usage;
+	const parts = [describeUsage(account.usage, now)];
+	if (account.pin) parts.unshift(account.pin === "locked" ? "pinned" : "pinned, failed over");
+	if (account.active) parts.unshift("active");
+	return parts.join(" · ");
+}
+
+/** Session entry recording a pin; `identityKey: null` records its removal. */
+const HARD_PIN_ENTRY = "account-switcher:hard-pin";
+
+interface HardPinEntry {
+	provider: string;
+	identityKey: string | null;
+}
+
+/** The key `sessions.restrict` names an account by; `null` when the credential carries no identity. */
+function identityKeyOf(auth: AuthStorage, provider: string, credentialId: number): string | null {
+	const entry = auth.credentials
+		.snapshot()
+		.credentials.find(candidate => candidate.provider === provider && candidate.id === credentialId);
+	return entry?.identityKey ?? null;
+}
+
+/**
+ * This process's pins. A pin names the account the user chose; while `lease`
+ * is held the session is restricted to it. Restrictions live in the auth
+ * store's memory, so a resumed session gets its pin back from the entries in
+ * its session file ({@link restore}).
+ */
+class HardPins {
+	/** `${sessionId}\0${provider}` -> pin. */
+	#pins = new Map<string, { identityKey: string; lease?: SessionRestrictionLease }>();
+
+	identityKey(provider: string, sessionId: string): string | undefined {
+		return this.#pins.get(`${sessionId}\0${provider}`)?.identityKey;
+	}
+
+	isLocked(provider: string, sessionId: string): boolean {
+		return this.#pins.get(`${sessionId}\0${provider}`)?.lease !== undefined;
+	}
+
+	providers(sessionId: string): string[] {
+		const prefix = `${sessionId}\0`;
+		return [...this.#pins.keys()].filter(key => key.startsWith(prefix)).map(key => key.slice(prefix.length));
+	}
+
+	/**
+	 * Restrict the session to the account and clear the account's blocks, so
+	 * that a block found on it later was set by a failure after this call.
+	 */
+	lock(auth: AuthStorage, provider: string, sessionId: string, identityKey: string): void {
+		const target = auth.credentials
+			.snapshot()
+			.credentials.find(entry => entry.provider === provider && entry.identityKey === identityKey);
+		if (target) {
+			for (const block of auth.blocks.list([target.id])) {
+				auth.blocks.delete(block.credentialId, block.providerKey, block.blockScope);
+			}
+		}
+		// `restrict` replaces an earlier restriction for the same provider and session.
+		const lease = auth.sessions.restrict(provider, sessionId, [identityKey]);
+		this.#pins.set(`${sessionId}\0${provider}`, { identityKey, lease });
+	}
+
+	/** Lift the restriction; with `keepPin` the session still remembers the account. */
+	unlock(auth: AuthStorage, provider: string, sessionId: string, keepPin = false): void {
+		const key = `${sessionId}\0${provider}`;
+		const pin = this.#pins.get(key);
+		if (!pin) return;
+		if (pin.lease) auth.sessions.unrestrict(provider, sessionId, pin.lease);
+		if (keepPin) this.#pins.set(key, { identityKey: pin.identityKey });
+		else this.#pins.delete(key);
+	}
+
+	/** Re-apply the pins recorded in the session file. The last entry per provider wins. */
+	restore(ctx: ExtensionContext): void {
+		const auth = ctx.modelRegistry.authStorage;
+		const sessionId = ctx.sessionManager.getSessionId();
+		const recorded = new Map<string, string | null>();
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== HARD_PIN_ENTRY) continue;
+			const data = entry.data as HardPinEntry | undefined;
+			if (data?.provider) recorded.set(data.provider, data.identityKey ?? null);
+		}
+		if (recorded.size === 0) return;
+		const stored = auth.credentials.snapshot().credentials;
+		for (const [provider, identityKey] of recorded) {
+			if (identityKey === null || this.identityKey(provider, sessionId) === identityKey) continue;
+			// Restricting to a logged-out account would leave the provider with no usable account.
+			if (!stored.some(entry => entry.provider === provider && entry.identityKey === identityKey)) {
+				if (ctx.hasUI) {
+					ctx.ui.notify(`${provider}: pinned account ${identityKey} is no longer stored; pin dropped.`, "warning");
+				}
+				continue;
+			}
+			this.lock(auth, provider, sessionId, identityKey);
+		}
+	}
+}
+
+/**
+ * Keep a pin honest after a provider error on the current model's provider.
+ *
+ * Locked: core blocks an account on a usage limit, policy denial, or auth
+ * failure, and {@link HardPins.lock} cleared older blocks, so a block on the
+ * pinned account means it failed since. Lift the lock and let core fail over.
+ * A transient error leaves no block and the lock stays.
+ *
+ * Lifted: core rotates through the other accounts on its own, blocking each
+ * one that fails. Once all of them are blocked nothing is left to try; go back
+ * to the account the user chose.
+ */
+function handleProviderError(ctx: ExtensionContext, hardPins: HardPins): void {
+	const provider = ctx.model?.provider;
+	if (!provider) return;
+	const auth = ctx.modelRegistry.authStorage;
+	const sessionId = ctx.sessionManager.getSessionId();
+	const identityKey = hardPins.identityKey(provider, sessionId);
+	if (identityKey === undefined) return;
+	const pinned = auth.credentials
+		.snapshot()
+		.credentials.find(entry => entry.provider === provider && entry.identityKey === identityKey);
+	if (!pinned) return;
+
+	if (hardPins.isLocked(provider, sessionId)) {
+		if (auth.blocks.list([pinned.id]).length === 0) return;
+		hardPins.unlock(auth, provider, sessionId, true);
+		if (ctx.hasUI) {
+			ctx.ui.notify(`${provider}: pinned account hit a limit or auth error; omp may fail over to another account.`, "warning");
+		}
+		return;
+	}
+	const others = auth.oauth
+		.accounts(provider, sessionId)
+		.map(account => account.credentialId)
+		.filter(credentialId => credentialId !== pinned.id);
+	const blocked = new Set(auth.blocks.list(others).map(block => block.credentialId));
+	if (others.some(credentialId => !blocked.has(credentialId))) return;
+	hardPins.lock(auth, provider, sessionId, identityKey);
+	auth.sessions.pin(provider, sessionId, pinned.id);
+	if (ctx.hasUI) ctx.ui.notify(`${provider}: every other account failed too; back on the pinned account.`, "warning");
+}
+
+/**
+ * A lifted pin whose account served a turn again has recovered: lock it, which
+ * also clears the block its failure left, so that block cannot move the
+ * session once the other accounts' blocks expire.
+ */
+function handleProviderSuccess(ctx: ExtensionContext, hardPins: HardPins): void {
+	const provider = ctx.model?.provider;
+	if (!provider) return;
+	const auth = ctx.modelRegistry.authStorage;
+	const sessionId = ctx.sessionManager.getSessionId();
+	const identityKey = hardPins.identityKey(provider, sessionId);
+	if (identityKey === undefined || hardPins.isLocked(provider, sessionId)) return;
+	const active = auth.oauth.accounts(provider, sessionId).find(account => account.active);
+	if (!active || identityKeyOf(auth, provider, active.credentialId) !== identityKey) return;
+	hardPins.lock(auth, provider, sessionId, identityKey);
 }
 
 /**
  * Every provider with at least one stored OAuth account, annotated with the
  * session's active account and each account's last recorded usage.
  */
-function collectProviderAccounts(auth: AuthStorage, sessionId: string): ProviderAccounts[] {
+function collectProviderAccounts(auth: AuthStorage, sessionId: string, hardPins: HardPins): ProviderAccounts[] {
+	const identityKeys = new Map(auth.credentials.snapshot().credentials.map(entry => [entry.id, entry.identityKey]));
 	const now = Date.now();
 	const providers: ProviderAccounts[] = [];
 	for (const provider of Object.keys(auth.credentials.all())) {
@@ -223,6 +392,10 @@ function collectProviderAccounts(auth: AuthStorage, sessionId: string): Provider
 			accounts: summaries.map(summary => ({
 				...summary,
 				label: formatAccountLabel(summary),
+				...(hardPins.identityKey(provider, sessionId) !== undefined &&
+				hardPins.identityKey(provider, sessionId) === identityKeys.get(summary.credentialId)
+					? { pin: hardPins.isLocked(provider, sessionId) ? ("locked" as const) : ("lifted" as const) }
+					: {}),
 				usage: summarizeUsage(provider, lookupUsageRows(index, summary), now),
 			})),
 		});
@@ -281,7 +454,8 @@ function writeReport(providers: ProviderAccounts[], now: number): void {
 		lines.push(entry.provider);
 		for (const account of entry.accounts) {
 			const marker = account.active ? "*" : " ";
-			lines.push(`  ${marker} ${account.position + 1}. ${account.label} — ${describeUsage(account.usage, now)}`);
+			const marks = account.pin ? ` (${account.pin === "locked" ? "pinned" : "pinned, failed over"})` : "";
+			lines.push(`  ${marker} ${account.position + 1}. ${account.label}${marks} — ${describeUsage(account.usage, now)}`);
 		}
 	}
 	lines.push("", "Switch with: /accounts switch <provider> <number|email|active>");
@@ -334,8 +508,12 @@ async function pickAccount(
 	return target.accounts.find(account => `${account.position + 1}. ${account.label}` === picked);
 }
 
-async function showAccountInfo(ctx: ExtensionCommandContext): Promise<void> {
-	const providers = collectProviderAccounts(ctx.modelRegistry.authStorage, ctx.sessionManager.getSessionId());
+async function showAccountInfo(ctx: ExtensionCommandContext, hardPins: HardPins): Promise<void> {
+	const providers = collectProviderAccounts(
+		ctx.modelRegistry.authStorage,
+		ctx.sessionManager.getSessionId(),
+		hardPins,
+	);
 	if (providers.length === 0) {
 		notify(ctx, "No stored OAuth accounts. Add one with /login.", "warning");
 		return;
@@ -352,20 +530,42 @@ async function showAccountInfo(ctx: ExtensionCommandContext): Promise<void> {
 		"Accounts info (read-only; Enter/Esc to close)",
 		providers.flatMap(entry =>
 			entry.accounts.map(account => ({
-				label: `${entry.provider} · ${account.position + 1}. ${account.label}${account.active ? " (active)" : ""}`,
-				description: describeUsage(account.usage, now),
+				label: `${entry.provider} · ${account.position + 1}. ${account.label}`,
+				description: describeAccount(account, now),
 			})),
 		),
 	);
 }
 
-async function runAccountsCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+/** `/accounts unpin [provider]`: drop this session's pin for one provider, or for all of them. */
+function unpinAccounts(pi: ExtensionAPI, ctx: ExtensionCommandContext, hardPins: HardPins, providerArg?: string): void {
+	const auth = ctx.modelRegistry.authStorage;
+	const sessionId = ctx.sessionManager.getSessionId();
+	const pinned = hardPins.providers(sessionId);
+	const targets = providerArg ? pinned.filter(provider => provider.toLowerCase() === providerArg.toLowerCase()) : pinned;
+	if (targets.length === 0) {
+		notify(ctx, providerArg ? `No pinned account for "${providerArg}" in this session.` : "No pinned accounts in this session.", "warning");
+		return;
+	}
+	for (const provider of targets) {
+		hardPins.unlock(auth, provider, sessionId);
+		pi.appendEntry<HardPinEntry>(HARD_PIN_ENTRY, { provider, identityKey: null });
+	}
+	notify(ctx, `${targets.join(", ")}: unpinned; omp may switch accounts again.`);
+}
+
+async function runAccountsCommand(
+	args: string,
+	ctx: ExtensionCommandContext,
+	pi: ExtensionAPI,
+	hardPins: HardPins,
+): Promise<void> {
 	const tokens = args.trim().split(/\s+/).filter(Boolean);
 	// Inspect the live session selection without resolving, refreshing, or
 	// pinning credentials. Unlike switching, this is safe during a turn.
 	if (tokens[0]?.toLowerCase() === "info") {
 		if (tokens.length > 1) notify(ctx, "Usage: /accounts info", "warning");
-		else await showAccountInfo(ctx);
+		else await showAccountInfo(ctx, hardPins);
 		return;
 	}
 
@@ -384,6 +584,12 @@ async function runAccountsCommand(args: string, ctx: ExtensionCommandContext): P
 		return;
 	}
 
+	if (tokens[0]?.toLowerCase() === "unpin") {
+		if (tokens.length > 2) notify(ctx, "Usage: /accounts unpin [provider]", "warning");
+		else unpinAccounts(pi, ctx, hardPins, tokens[1]);
+		return;
+	}
+
 	const auth = ctx.modelRegistry.authStorage;
 	// Pick up logins/logouts performed elsewhere since this session started.
 	await auth.credentials.reload();
@@ -391,7 +597,7 @@ async function runAccountsCommand(args: string, ctx: ExtensionCommandContext): P
 
 	const now = Date.now();
 	const sessionId = ctx.sessionManager.getSessionId();
-	const providers = collectProviderAccounts(auth, sessionId);
+	const providers = collectProviderAccounts(auth, sessionId, hardPins);
 	if (providers.length === 0) {
 		notify(ctx, "No stored OAuth accounts. Add one with /login.", "warning");
 		return;
@@ -447,9 +653,20 @@ async function runAccountsCommand(args: string, ctx: ExtensionCommandContext): P
 	}
 	if (!chosen) return;
 
+	// Lock before pinning: a session locked to another account refuses a pin
+	// outside its restriction.
+	const identityKey = identityKeyOf(auth, target.provider, chosen.credentialId);
+	const previousKey = hardPins.identityKey(target.provider, sessionId);
+	if (identityKey !== null) hardPins.lock(auth, target.provider, sessionId, identityKey);
+	else hardPins.unlock(auth, target.provider, sessionId);
 	if (!auth.sessions.pin(target.provider, sessionId, chosen.credentialId)) {
+		if (previousKey !== undefined) hardPins.lock(auth, target.provider, sessionId, previousKey);
+		else hardPins.unlock(auth, target.provider, sessionId);
 		notify(ctx, `${chosen.label} is no longer available to pin for ${target.provider}.`, "error");
 		return;
+	}
+	if (identityKey !== previousKey) {
+		pi.appendEntry<HardPinEntry>(HARD_PIN_ENTRY, { provider: target.provider, identityKey });
 	}
 
 	const modelProvider = ctx.model?.provider;
@@ -457,7 +674,18 @@ async function runAccountsCommand(args: string, ctx: ExtensionCommandContext): P
 		modelProvider && modelProvider !== target.provider
 			? ` (current model runs on ${modelProvider}; takes effect when you switch to a ${target.provider} model)`
 			: "";
-	notify(ctx, `${target.provider}: this session now uses ${chosen.label}${suffix}.`);
+	if (identityKey === null) {
+		notify(
+			ctx,
+			`${target.provider}: pinned ${chosen.label}, but it has no account identity to lock on; omp may still switch away${suffix}.`,
+			"warning",
+		);
+		return;
+	}
+	notify(
+		ctx,
+		`${target.provider}: pinned ${chosen.label}; omp stays on it until it fails${suffix}. /accounts unpin drops the pin.`,
+	);
 }
 
 export default function accountSwitcher(pi: ExtensionAPI): void {
@@ -466,6 +694,7 @@ export default function accountSwitcher(pi: ExtensionAPI): void {
 	// Argument autocomplete is synchronous while the provider list comes from
 	// the auth store, so it is snapshotted per session binding: on session
 	// start and after each run (a `/login` between runs shows up next time).
+	const hardPins = new HardPins();
 	let providerCompletions: string[] = [];
 	const refreshProviderCompletions = (auth: AuthStorage): void => {
 		providerCompletions = Object.keys(auth.credentials.all())
@@ -483,7 +712,8 @@ export default function accountSwitcher(pi: ExtensionAPI): void {
 			const wanted = prefix.toLowerCase();
 			const items = [
 				{ value: "info", label: "info", description: "Show all providers' OAuth accounts, active selections, and usage" },
-				{ value: "switch", label: "switch", description: "Pick a provider, then an account" },
+				{ value: "switch", label: "switch", description: "Pick a provider, then an account, and lock the session to it" },
+				{ value: "unpin", label: "unpin", description: "Lift this session's account lock" },
 				...providerCompletions.map(provider => ({
 					value: provider,
 					label: provider,
@@ -494,7 +724,7 @@ export default function accountSwitcher(pi: ExtensionAPI): void {
 		},
 		handler: async (args, ctx) => {
 			try {
-				await runAccountsCommand(args, ctx);
+				await runAccountsCommand(args, ctx, pi, hardPins);
 			} finally {
 				refreshProviderCompletions(ctx.modelRegistry.authStorage);
 			}
@@ -503,5 +733,19 @@ export default function accountSwitcher(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, ctx) => {
 		refreshProviderCompletions(ctx.modelRegistry.authStorage);
+		hardPins.restore(ctx);
+	});
+	// A switch, fork, or branch can land on another session id, whose pins are its own.
+	pi.on("session_switch", (_event, ctx) => hardPins.restore(ctx));
+	pi.on("session_branch", (_event, ctx) => hardPins.restore(ctx));
+	// A failed attempt surfaces as a retry announcement, a failed retry saga, or an errored turn.
+	pi.on("auto_retry_start", (_event, ctx) => handleProviderError(ctx, hardPins));
+	pi.on("auto_retry_end", (event, ctx) => {
+		if (!event.success) handleProviderError(ctx, hardPins);
+	});
+	pi.on("turn_end", (event, ctx) => {
+		if (event.message.role !== "assistant") return;
+		if (event.message.stopReason === "error") handleProviderError(ctx, hardPins);
+		else if (event.message.stopReason !== "aborted") handleProviderSuccess(ctx, hardPins);
 	});
 }
